@@ -27,19 +27,34 @@ export default function Home() {
     setError('');
 
     try {
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 80000); // 80s timeout
+
       const response = await fetch('/api/extract-pdf', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ pdfUrl }),
+        signal: controller.signal
       });
+
+      clearTimeout(timeoutId);
+
       if (!response.ok) {
         const errorData = await response.json();
+        if (response.status === 408) {
+          throw new Error('Processing timeout exceeded. Please try again with a smaller PDF.');
+        }
         throw new Error(errorData.error || 'Extraction failed');
       }
+
       const data = await response.json();
       setExtractedText(data.extracted_data);
     } catch (err: any) {
-      setError(err.message);
+      if (err.name === 'AbortError') {
+        setError('Request timed out. Please try again with a smaller PDF.');
+      } else {
+        setError(err.message);
+      }
     } finally {
       setLoading(false);
     }

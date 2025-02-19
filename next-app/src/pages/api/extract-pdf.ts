@@ -14,16 +14,19 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
 
       const response = await fetch(`${BACKEND_URL}/extract`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 
+          'Content-Type': 'application/json',
+          'Accept': 'application/json'
+        },
         body: JSON.stringify({ pdf_url: pdfUrl })
       });
 
-      const data = await response.json();
-      
       if (!response.ok) {
-        return res.status(response.status).json(data);
+        const errorData = await response.json();
+        return res.status(response.status).json(errorData);
       }
 
+      const data = await response.json();
       return res.status(200).json(data);
     } catch (error: any) {
       return res.status(500).json({ 
