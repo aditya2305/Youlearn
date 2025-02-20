@@ -6,20 +6,20 @@ ENV PYTHONUNBUFFERED=1
 ENV MALLOC_ARENA_MAX=2
 ENV PYTHONMALLOC=malloc
 ENV PYTHONPATH=/app
-ENV TESSDATA_PREFIX=/usr/share/tesseract-ocr/4.00/tessdata
+ENV TESSDATA_PREFIX=/usr/share/tesseract-ocr/5.00/tessdata
 ENV DOCKER_CONTAINER=true
 
 WORKDIR /app
 
-# Install system dependencies in one layer with specific versions
+# Install system dependencies without specific versions
 RUN apt-get update && apt-get install -y \
-    gcc=4:10.2.1-1 \
-    libpoppler-cpp-dev=20.09.0-3.1 \
-    pkg-config=0.29.2-1 \
-    poppler-utils=20.09.0-3.1 \
-    tesseract-ocr=4.1.1-2.1 \
-    tesseract-ocr-eng=1:4.00~git30-7274cfa-1.1 \
-    libtesseract-dev=4.1.1-2.1 \
+    gcc \
+    libpoppler-cpp-dev \
+    pkgconf \
+    poppler-utils \
+    tesseract-ocr \
+    tesseract-ocr-eng \
+    libtesseract-dev \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
