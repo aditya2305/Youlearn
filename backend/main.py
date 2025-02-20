@@ -17,8 +17,11 @@ import httpx
 from fastapi.responses import StreamingResponse
 import multiprocessing
 import json
+import os
 
-multiprocessing.set_start_method("fork", force=True)
+# Only set fork method if we're not in a container
+if os.environ.get('DOCKER_CONTAINER') != 'true':
+    multiprocessing.set_start_method("fork", force=True)
 
 app = FastAPI()
 
@@ -34,9 +37,9 @@ app.add_middleware(
 
 # Adjust processing parameters for speed
 PROCESSING_TIMEOUT = 75  # Maximum 75 seconds
-MAX_WORKERS = min(multiprocessing.cpu_count() * 4, 32)  # Increase worker count
-CHUNK_SIZE = 10  # Process more pages per chunk
-BATCH_SIZE = 50  # Larger batch size for fewer updates
+MAX_WORKERS = min(int(os.getenv('WORKERS', '2')), 4)  # Limit max workers
+CHUNK_SIZE = 5  # Reduce chunk size for better stability
+BATCH_SIZE = 25  # Smaller batch size for more frequent updates
 MAX_PAGES = 2000
 
 class ProcessingStatus:
@@ -226,47 +229,34 @@ async def process_pdf_with_timeout(pdf_bytes: bytes):
                 "processed_pages": 0
             }) + "\n").encode("utf-8")
 
-            # Process in larger chunks with more workers
-            loop = asyncio.get_event_loop()
+            # Use a smaller number of workers
             with ProcessPoolExecutor(max_workers=MAX_WORKERS, initializer=init_worker, initargs=(pdf_bytes,)) as executor:
+                loop = asyncio.get_event_loop()
                 tasks = []
+                
+                # Process in smaller chunks
                 for chunk_start in range(0, total_pages, CHUNK_SIZE):
                     if time.time() - start_time > PROCESSING_TIMEOUT:
-                        # Return partial results if timeout reached
-                        yield (json.dumps({
-                            "type": "data",
-                            "extracted_data": text_with_bboxes,
-                            "is_complete": True
-                        }) + "\n").encode("utf-8")
-                        return
+                        break
 
                     chunk_end = min(chunk_start + CHUNK_SIZE, total_pages)
-                    tasks.extend([
+                    chunk_tasks = [
                         loop.run_in_executor(executor, process_page_worker, page_index, "searchable")
                         for page_index in range(chunk_start, chunk_end)
-                    ])
-
-                    # Process chunks of tasks
-                    if len(tasks) >= MAX_WORKERS * 2:
-                        chunk_results = await asyncio.gather(*tasks)
-                        tasks = []
-                        
-                        for result in chunk_results:
-                            current_batch.extend(result)
-                            if len(current_batch) >= BATCH_SIZE:
-                                yield (json.dumps({
-                                    "type": "data",
-                                    "extracted_data": current_batch,
-                                    "is_complete": False
-                                }) + "\n").encode("utf-8")
-                                text_with_bboxes.extend(current_batch)
-                                current_batch = []
-
-                # Process remaining tasks
-                if tasks:
-                    chunk_results = await asyncio.gather(*tasks)
+                    ]
+                    
+                    # Process each chunk immediately
+                    chunk_results = await asyncio.gather(*chunk_tasks)
                     for result in chunk_results:
                         current_batch.extend(result)
+                        if len(current_batch) >= BATCH_SIZE:
+                            yield (json.dumps({
+                                "type": "data",
+                                "extracted_data": current_batch,
+                                "is_complete": False
+                            }) + "\n").encode("utf-8")
+                            text_with_bboxes.extend(current_batch)
+                            current_batch = []
 
                 # Send final batch
                 if current_batch:

@@ -5,15 +5,22 @@ ENV PYTHONUNBUFFERED=1
 # Add memory limit environment variables
 ENV MALLOC_ARENA_MAX=2
 ENV PYTHONMALLOC=malloc
+ENV PYTHONPATH=/app
+ENV TESSDATA_PREFIX=/usr/share/tesseract-ocr/4.00/tessdata
 
 WORKDIR /app
 
-RUN apt-get update && apt-get update && apt-get install -y \
+# Install system dependencies in one layer
+RUN apt-get update && apt-get install -y \
     gcc \
     libpoppler-cpp-dev \
     pkg-config \
     poppler-utils \
     tesseract-ocr \
+    tesseract-ocr-eng \
+    tesseract-ocr-fra \
+    tesseract-ocr-deu \
+    libtesseract-dev \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
@@ -26,5 +33,5 @@ COPY . /app/
 
 EXPOSE 8000
 
-# Use environment variable for workers
-CMD uvicorn main:app --host 0.0.0.0 --port 8000 --workers ${WORKERS:-4} --timeout-keep-alive 75
+# Use environment variable for workers and specify worker class
+CMD uvicorn main:app --host 0.0.0.0 --port 8000 --workers ${WORKERS:-2} --worker-class uvicorn.workers.UvicornWorker --timeout-keep-alive 75
