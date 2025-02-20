@@ -11,10 +11,10 @@ services:
     deploy:
       resources:
         limits:
-          cpus: '2'
+          cpus: '0.8'
           memory: 4G
         reservations:
-          cpus: '1'
+          cpus: '0.5'
           memory: 2G
     environment:
       - MALLOC_ARENA_MAX=2
@@ -35,6 +35,7 @@ services:
     deploy:
       resources:
         limits:
+          cpus: '0.2'
           memory: 1G
     depends_on:
       - backend
