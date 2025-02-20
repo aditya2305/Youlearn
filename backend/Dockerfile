@@ -33,10 +33,12 @@ COPY . /app/
 EXPOSE 8000
 
 # Use gunicorn for production
-CMD gunicorn main:app --workers ${WORKERS:-2} \
+CMD gunicorn main:app --workers ${WORKERS:-4} \
     --worker-class uvicorn.workers.UvicornWorker \
     --bind 0.0.0.0:8000 \
-    --timeout 120 \
-    --keep-alive 75 \
-    --max-requests 1000 \
-    --max-requests-jitter 50
+    --timeout 75 \
+    --keep-alive 120 \
+    --max-requests 2000 \
+    --max-requests-jitter 100 \
+    --worker-tmp-dir /dev/shm \
+    --preload

@@ -11,17 +11,17 @@ services:
     deploy:
       resources:
         limits:
-          cpus: '0.8'
-          memory: 2G
+          cpus: '1.8'
+          memory: 6G
         reservations:
-          cpus: '0.5'
-          memory: 1G
+          cpus: '1'
+          memory: 4G
     environment:
-      - MALLOC_ARENA_MAX=2
+      - MALLOC_ARENA_MAX=4
       - PYTHONMALLOC=malloc
-      - WORKERS=2
+      - WORKERS=4
       - PYTHONUNBUFFERED=1
-      - MAX_WORKERS=2
+      - MAX_WORKERS=4
     restart: unless-stopped
     ulimits:
       nofile:

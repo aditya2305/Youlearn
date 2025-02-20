@@ -39,9 +39,9 @@ app.add_middleware(
 
 # Adjust processing parameters for speed
 PROCESSING_TIMEOUT = 75  # Maximum 75 seconds
-MAX_WORKERS = min(int(os.getenv('WORKERS', '2')), 4)  # Limit max workers
-CHUNK_SIZE = 5  # Reduce chunk size for better stability
-BATCH_SIZE = 25  # Smaller batch size for more frequent updates
+MAX_WORKERS = min(int(os.getenv('WORKERS', '4')), 6)  # Limit max workers
+CHUNK_SIZE = 15  # Reduce chunk size for better stability
+BATCH_SIZE = 40  # Smaller batch size for more frequent updates
 MAX_PAGES = 2000
 
 class ProcessingStatus:
@@ -212,8 +212,6 @@ def perform_ocr_on_image(img, page_number):
 
 async def process_pdf_with_timeout(pdf_bytes: bytes):
     start_time = time.time()
-    text_with_bboxes = []
-    current_batch = []
     
     try:
         logging.info("Starting PDF processing")
@@ -227,63 +225,30 @@ async def process_pdf_with_timeout(pdf_bytes: bytes):
                     detail=f"PDF has too many pages ({total_pages}). Maximum allowed is {MAX_PAGES}"
                 )
             
-            yield (json.dumps({
-                "type": "progress",
-                "total_pages": total_pages,
-                "processed_pages": 0
-            }) + "\n").encode("utf-8")
-
-            # Create list of tasks with PDF bytes for each page
+            # Process in parallel with larger chunks but maintain timeout
             tasks = [(pdf_bytes, page_num) for page_num in range(total_pages)]
             
-            # Process in chunks
             for chunk_start in range(0, len(tasks), CHUNK_SIZE):
                 if time.time() - start_time > PROCESSING_TIMEOUT:
                     logging.warning("Processing timeout reached")
                     break
 
-                chunk_end = min(chunk_start + CHUNK_SIZE, len(tasks))
                 chunk = tasks[chunk_start:chunk_end]
                 
-                try:
-                    # Process chunk using ProcessPoolExecutor
-                    with ProcessPoolExecutor(max_workers=2) as executor:
-                        results = list(executor.map(process_page_worker, chunk))
-                        
-                        # Handle results
-                        for page_results in results:
-                            if page_results:  # Only process if we got results
-                                current_batch.extend(page_results)
-                                if len(current_batch) >= BATCH_SIZE:
-                                    logging.info(f"Sending batch of {len(current_batch)} items")
-                                    yield (json.dumps({
-                                        "type": "data",
-                                        "extracted_data": current_batch,
-                                        "is_complete": False
-                                    }) + "\n").encode("utf-8")
-                                    text_with_bboxes.extend(current_batch)
-                                    current_batch = []
-                
-                except Exception as e:
-                    logging.error(f"Error processing chunk: {str(e)}")
-                    continue
-
-            # Send remaining batch
-            if current_batch:
-                logging.info(f"Sending final batch of {len(current_batch)} items")
-                yield (json.dumps({
-                    "type": "data",
-                    "extracted_data": current_batch,
-                    "is_complete": False
-                }) + "\n").encode("utf-8")
-                text_with_bboxes.extend(current_batch)
-
-            logging.info("Processing completed successfully")
-            yield (json.dumps({
-                "type": "data",
-                "extracted_data": [],
-                "is_complete": True
-            }) + "\n").encode("utf-8")
+                with ProcessPoolExecutor(max_workers=MAX_WORKERS) as executor:
+                    chunk_results = list(executor.map(
+                        process_page_worker, 
+                        chunk,
+                        timeout=max(1, PROCESSING_TIMEOUT - (time.time() - start_time))
+                    ))
+                    
+                    # Batch and send results immediately
+                    if chunk_results:
+                        yield (json.dumps({
+                            "type": "data",
+                            "extracted_data": chunk_results,
+                            "is_complete": False
+                        }) + "\n").encode("utf-8")
 
     except Exception as e:
         logging.error(f"Processing error: {str(e)}", exc_info=True)
