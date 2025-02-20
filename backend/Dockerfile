@@ -7,6 +7,7 @@ ENV MALLOC_ARENA_MAX=2
 ENV PYTHONMALLOC=malloc
 ENV PYTHONPATH=/app
 ENV TESSDATA_PREFIX=/usr/share/tesseract-ocr/4.00/tessdata
+ENV DOCKER_CONTAINER=true
 
 WORKDIR /app
 
@@ -33,5 +34,5 @@ COPY . /app/
 
 EXPOSE 8000
 
-# Use environment variable for workers and specify worker class
-CMD uvicorn main:app --host 0.0.0.0 --port 8000 --workers ${WORKERS:-2} --worker-class uvicorn.workers.UvicornWorker --timeout-keep-alive 75
+# Simplified uvicorn command without worker-class
+CMD uvicorn main:app --host 0.0.0.0 --port 8000 --workers ${WORKERS:-2} --timeout-keep-alive 75
