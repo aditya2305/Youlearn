@@ -19,9 +19,11 @@ import multiprocessing
 import json
 import os
 
-# Only set fork method if we're not in a container
-if os.environ.get('DOCKER_CONTAINER') != 'true':
-    multiprocessing.set_start_method("fork", force=True)
+# Set spawn method for multiprocessing in Docker
+if os.environ.get('DOCKER_CONTAINER') == 'true':
+    multiprocessing.set_start_method('spawn', force=True)
+else:
+    multiprocessing.set_start_method('fork', force=True)
 
 app = FastAPI()
 
@@ -51,30 +53,30 @@ class ProcessingStatus:
 class ExtractRequest(BaseModel):
     pdf_url: HttpUrl
 
-# Global variable in the worker to hold the opened PDF
-global_pdf = None
-
-def init_worker(pdf_bytes):
-    """
-    Initializer for each worker process: open the PDF and monkey-patch the
-    cached method to allow pickling.
-    """
-    # Remove the lru_cache wrapper from the _get_text_layout method.
-    # This avoids the pickle error when using the multiprocessing spawn method.
-    from pdfplumber.page import Page
-    if hasattr(Page._get_text_layout, "__wrapped__"):
-        Page._get_text_layout = Page._get_text_layout.__wrapped__
-    global global_pdf
-    global_pdf = pdfplumber.open(io.BytesIO(pdf_bytes))
-
-def process_page_worker(page_index, process_type):
-    """Worker function: get page by index from the global PDF and process it."""
-    global global_pdf
+def process_page_worker(args):
+    """Worker function that processes a single page"""
     try:
-        page = global_pdf.pages[page_index]
-        return process_page(page, process_type)
+        pdf_bytes, page_num = args
+        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+            page = pdf.pages[page_num]
+            words = page.extract_words()
+            results = []
+            
+            for word in words:
+                x0 = word["x0"] / page.width
+                y0 = word["top"] / page.height
+                x1 = word["x1"] / page.width
+                y1 = word["bottom"] / page.height
+                
+                results.append({
+                    "text": word["text"],
+                    "bbox": [x0, y0, x1, y1],
+                    "page_num": page_num + 1
+                })
+            
+            return results
     except Exception as e:
-        logging.error(f"Error processing page {page_index}: {str(e)}")
+        logging.error(f"Error processing page {page_num}: {str(e)}")
         return []
 
 def process_searchable_pdf(pdf_bytes: bytes):
@@ -214,74 +216,77 @@ async def process_pdf_with_timeout(pdf_bytes: bytes):
     current_batch = []
     
     try:
-        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf_temp:
-            total_pages = len(pdf_temp.pages)
+        logging.info("Starting PDF processing")
+        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+            total_pages = len(pdf.pages)
+            logging.info(f"PDF has {total_pages} pages")
+            
             if total_pages > MAX_PAGES:
                 raise HTTPException(
                     status_code=400,
                     detail=f"PDF has too many pages ({total_pages}). Maximum allowed is {MAX_PAGES}"
                 )
             
-            # Send initial progress
             yield (json.dumps({
                 "type": "progress",
                 "total_pages": total_pages,
                 "processed_pages": 0
             }) + "\n").encode("utf-8")
 
-            # Use a smaller number of workers
-            with ProcessPoolExecutor(max_workers=MAX_WORKERS, initializer=init_worker, initargs=(pdf_bytes,)) as executor:
-                loop = asyncio.get_event_loop()
-                tasks = []
+            # Create list of tasks with PDF bytes for each page
+            tasks = [(pdf_bytes, page_num) for page_num in range(total_pages)]
+            
+            # Process in chunks
+            for chunk_start in range(0, len(tasks), CHUNK_SIZE):
+                if time.time() - start_time > PROCESSING_TIMEOUT:
+                    logging.warning("Processing timeout reached")
+                    break
+
+                chunk_end = min(chunk_start + CHUNK_SIZE, len(tasks))
+                chunk = tasks[chunk_start:chunk_end]
                 
-                # Process in smaller chunks
-                for chunk_start in range(0, total_pages, CHUNK_SIZE):
-                    if time.time() - start_time > PROCESSING_TIMEOUT:
-                        break
+                try:
+                    # Process chunk using ProcessPoolExecutor
+                    with ProcessPoolExecutor(max_workers=2) as executor:
+                        results = list(executor.map(process_page_worker, chunk))
+                        
+                        # Handle results
+                        for page_results in results:
+                            if page_results:  # Only process if we got results
+                                current_batch.extend(page_results)
+                                if len(current_batch) >= BATCH_SIZE:
+                                    logging.info(f"Sending batch of {len(current_batch)} items")
+                                    yield (json.dumps({
+                                        "type": "data",
+                                        "extracted_data": current_batch,
+                                        "is_complete": False
+                                    }) + "\n").encode("utf-8")
+                                    text_with_bboxes.extend(current_batch)
+                                    current_batch = []
+                
+                except Exception as e:
+                    logging.error(f"Error processing chunk: {str(e)}")
+                    continue
 
-                    chunk_end = min(chunk_start + CHUNK_SIZE, total_pages)
-                    chunk_tasks = [
-                        loop.run_in_executor(executor, process_page_worker, page_index, "searchable")
-                        for page_index in range(chunk_start, chunk_end)
-                    ]
-                    
-                    # Process each chunk immediately
-                    chunk_results = await asyncio.gather(*chunk_tasks)
-                    for result in chunk_results:
-                        current_batch.extend(result)
-                        if len(current_batch) >= BATCH_SIZE:
-                            yield (json.dumps({
-                                "type": "data",
-                                "extracted_data": current_batch,
-                                "is_complete": False
-                            }) + "\n").encode("utf-8")
-                            text_with_bboxes.extend(current_batch)
-                            current_batch = []
-
-                # Send final batch
-                if current_batch:
-                    yield (json.dumps({
-                        "type": "data",
-                        "extracted_data": current_batch,
-                        "is_complete": False
-                    }) + "\n").encode("utf-8")
-                    text_with_bboxes.extend(current_batch)
-
-                # Final completion message
+            # Send remaining batch
+            if current_batch:
+                logging.info(f"Sending final batch of {len(current_batch)} items")
                 yield (json.dumps({
                     "type": "data",
-                    "extracted_data": [],
-                    "is_complete": True
+                    "extracted_data": current_batch,
+                    "is_complete": False
                 }) + "\n").encode("utf-8")
+                text_with_bboxes.extend(current_batch)
 
-    except TimeoutError:
-        yield (json.dumps({
-            "type": "data",
-            "extracted_data": text_with_bboxes,
-            "is_complete": True
-        }) + "\n").encode("utf-8")
+            logging.info("Processing completed successfully")
+            yield (json.dumps({
+                "type": "data",
+                "extracted_data": [],
+                "is_complete": True
+            }) + "\n").encode("utf-8")
+
     except Exception as e:
-        logging.error(f"PDF processing error: {str(e)}")
+        logging.error(f"Processing error: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/extract")

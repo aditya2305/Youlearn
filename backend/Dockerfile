@@ -11,17 +11,15 @@ ENV DOCKER_CONTAINER=true
 
 WORKDIR /app
 
-# Install system dependencies in one layer
+# Install system dependencies in one layer with specific versions
 RUN apt-get update && apt-get install -y \
-    gcc \
-    libpoppler-cpp-dev \
-    pkg-config \
-    poppler-utils \
-    tesseract-ocr \
-    tesseract-ocr-eng \
-    tesseract-ocr-fra \
-    tesseract-ocr-deu \
-    libtesseract-dev \
+    gcc=4:10.2.1-1 \
+    libpoppler-cpp-dev=20.09.0-3.1 \
+    pkg-config=0.29.2-1 \
+    poppler-utils=20.09.0-3.1 \
+    tesseract-ocr=4.1.1-2.1 \
+    tesseract-ocr-eng=1:4.00~git30-7274cfa-1.1 \
+    libtesseract-dev=4.1.1-2.1 \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
@@ -34,5 +32,11 @@ COPY . /app/
 
 EXPOSE 8000
 
-# Simplified uvicorn command without worker-class
-CMD uvicorn main:app --host 0.0.0.0 --port 8000 --workers ${WORKERS:-2} --timeout-keep-alive 75
+# Use gunicorn for production
+CMD gunicorn main:app --workers ${WORKERS:-2} \
+    --worker-class uvicorn.workers.UvicornWorker \
+    --bind 0.0.0.0:8000 \
+    --timeout 120 \
+    --keep-alive 75 \
+    --max-requests 1000 \
+    --max-requests-jitter 50

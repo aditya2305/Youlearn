@@ -12,15 +12,21 @@ services:
       resources:
         limits:
           cpus: '0.8'
-          memory: 4G
+          memory: 2G
         reservations:
           cpus: '0.5'
-          memory: 2G
+          memory: 1G
     environment:
       - MALLOC_ARENA_MAX=2
       - PYTHONMALLOC=malloc
       - WORKERS=4
+      - PYTHONUNBUFFERED=1
+      - MAX_WORKERS=2
     restart: unless-stopped
+    ulimits:
+      nofile:
+        soft: 4096
+        hard: 4096
 
   frontend:
     build:
@@ -32,6 +38,7 @@ services:
     environment:
       BACKEND_URL: "http://backend:8000"
       NODE_ENV: "production"
+      NEXT_PUBLIC_MAX_BODY_SIZE: "10mb"
     deploy:
       resources:
         limits:

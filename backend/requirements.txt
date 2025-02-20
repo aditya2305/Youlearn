@@ -6,3 +6,4 @@ pytesseract
 Pillow
 httpx
 python-multipart
+gunicorn==21.2.0
