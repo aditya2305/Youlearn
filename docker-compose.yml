@@ -6,22 +6,36 @@ services:
       context: ./backend
       dockerfile: Dockerfile
     container_name: backend
- 
     ports:
       - "8000:8000"
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 4G
+        reservations:
+          cpus: '1'
+          memory: 2G
+    environment:
+      - MALLOC_ARENA_MAX=2
+      - PYTHONMALLOC=malloc
+      - WORKERS=4
+    restart: unless-stopped
 
   frontend:
-
     build:
       context: ./next-app
       dockerfile: Dockerfile
     container_name: frontend
- 
     ports:
       - "3000:3000"
-  
     environment:
       BACKEND_URL: "http://backend:8000"
-  
+      NODE_ENV: "production"
+    deploy:
+      resources:
+        limits:
+          memory: 1G
     depends_on:
       - backend
+    restart: unless-stopped

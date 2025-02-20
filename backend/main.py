@@ -33,11 +33,11 @@ app.add_middleware(
 )
 
 # Adjust processing parameters for speed
-PROCESSING_TIMEOUT = 75  # Set to 75 seconds max
-MAX_WORKERS = 32  # Increase worker threads significantly
-CHUNK_SIZE = 10  # Smaller chunks for faster partial results
-BATCH_SIZE = 50  # Number of pages to process before sending partial results
-MAX_PAGES = 2000  # Increase maximum allowed pages
+PROCESSING_TIMEOUT = 75  # Maximum 75 seconds
+MAX_WORKERS = min(multiprocessing.cpu_count() * 4, 32)  # Increase worker count
+CHUNK_SIZE = 10  # Process more pages per chunk
+BATCH_SIZE = 50  # Larger batch size for fewer updates
+MAX_PAGES = 2000
 
 class ProcessingStatus:
     def __init__(self):
@@ -206,90 +206,84 @@ def perform_ocr_on_image(img, page_number):
         return []
 
 async def process_pdf_with_timeout(pdf_bytes: bytes):
-    """Process a PDF in batches with a maximum timeout of 75 seconds.
-    Yields partial results as JSON-encoded bytes with newline delimiter.
-    """
     start_time = time.time()
     text_with_bboxes = []
     current_batch = []
     
     try:
-        # Use a temporary pdfplumber instance to determine total pages
         with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf_temp:
             total_pages = len(pdf_temp.pages)
-        if total_pages > MAX_PAGES:
-            raise HTTPException(
-                status_code=400,
-                detail=f"PDF has too many pages ({total_pages}). Maximum allowed is {MAX_PAGES}"
-            )
-        
-        # Send initial progress message
-        yield (json.dumps({
-            "type": "progress",
-            "total_pages": total_pages,
-            "processed_pages": 0
-        }) + "\n").encode("utf-8")
+            if total_pages > MAX_PAGES:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"PDF has too many pages ({total_pages}). Maximum allowed is {MAX_PAGES}"
+                )
+            
+            # Send initial progress
+            yield (json.dumps({
+                "type": "progress",
+                "total_pages": total_pages,
+                "processed_pages": 0
+            }) + "\n").encode("utf-8")
 
-        loop = asyncio.get_event_loop()
-        with ProcessPoolExecutor(max_workers=MAX_WORKERS, initializer=init_worker, initargs=(pdf_bytes,)) as executor:
-            for chunk_start in range(0, total_pages, CHUNK_SIZE):
-                if time.time() - start_time > PROCESSING_TIMEOUT:
-                    yield (json.dumps({
-                        "type": "data",
-                        "extracted_data": text_with_bboxes,
-                        "is_complete": True
-                    }) + "\n").encode("utf-8")
-                    return
-                
-                chunk_end = min(chunk_start + CHUNK_SIZE, total_pages)
-                tasks = [
-                    loop.run_in_executor(executor, process_page_worker, page_index, "searchable")
-                    for page_index in range(chunk_start, chunk_end)
-                ]
-                chunk_results = await asyncio.gather(*tasks)
-                chunk_text = [item for sublist in chunk_results for item in sublist]
-                
-                if chunk_text:
-                    current_batch.extend(chunk_text)
-                else:
-                    tasks = [
-                        loop.run_in_executor(executor, process_page_worker, page_index, "ocr")
+            # Process in larger chunks with more workers
+            loop = asyncio.get_event_loop()
+            with ProcessPoolExecutor(max_workers=MAX_WORKERS, initializer=init_worker, initargs=(pdf_bytes,)) as executor:
+                tasks = []
+                for chunk_start in range(0, total_pages, CHUNK_SIZE):
+                    if time.time() - start_time > PROCESSING_TIMEOUT:
+                        # Return partial results if timeout reached
+                        yield (json.dumps({
+                            "type": "data",
+                            "extracted_data": text_with_bboxes,
+                            "is_complete": True
+                        }) + "\n").encode("utf-8")
+                        return
+
+                    chunk_end = min(chunk_start + CHUNK_SIZE, total_pages)
+                    tasks.extend([
+                        loop.run_in_executor(executor, process_page_worker, page_index, "searchable")
                         for page_index in range(chunk_start, chunk_end)
-                    ]
-                    ocr_results = await asyncio.gather(*tasks)
-                    current_batch.extend([item for sublist in ocr_results for item in sublist])
-                
-                # Send progress update
-                yield (json.dumps({
-                    "type": "progress",
-                    "total_pages": total_pages,
-                    "processed_pages": chunk_end
-                }) + "\n").encode("utf-8")
-                
-                if len(current_batch) >= BATCH_SIZE:
-                    text_with_bboxes.extend(current_batch)
+                    ])
+
+                    # Process chunks of tasks
+                    if len(tasks) >= MAX_WORKERS * 2:
+                        chunk_results = await asyncio.gather(*tasks)
+                        tasks = []
+                        
+                        for result in chunk_results:
+                            current_batch.extend(result)
+                            if len(current_batch) >= BATCH_SIZE:
+                                yield (json.dumps({
+                                    "type": "data",
+                                    "extracted_data": current_batch,
+                                    "is_complete": False
+                                }) + "\n").encode("utf-8")
+                                text_with_bboxes.extend(current_batch)
+                                current_batch = []
+
+                # Process remaining tasks
+                if tasks:
+                    chunk_results = await asyncio.gather(*tasks)
+                    for result in chunk_results:
+                        current_batch.extend(result)
+
+                # Send final batch
+                if current_batch:
                     yield (json.dumps({
                         "type": "data",
                         "extracted_data": current_batch,
                         "is_complete": False
                     }) + "\n").encode("utf-8")
-                    current_batch = []
-            
-            if current_batch:
-                text_with_bboxes.extend(current_batch)
+                    text_with_bboxes.extend(current_batch)
+
+                # Final completion message
                 yield (json.dumps({
                     "type": "data",
-                    "extracted_data": current_batch,
-                    "is_complete": False
+                    "extracted_data": [],
+                    "is_complete": True
                 }) + "\n").encode("utf-8")
-            
-            # Final completion message
-            yield (json.dumps({
-                "type": "data",
-                "extracted_data": [],
-                "is_complete": True
-            }) + "\n").encode("utf-8")
-    
+
     except TimeoutError:
         yield (json.dumps({
             "type": "data",
@@ -305,7 +299,10 @@ async def extract_text(request: ExtractRequest):
     try:
         logging.info(f"Received request for URL: {request.pdf_url}")
         async with httpx.AsyncClient() as client:
-            response = await client.get(str(request.pdf_url), timeout=30.0)
+            response = await client.get(
+                str(request.pdf_url), 
+                timeout=60.0  # Increase timeout for large files
+            )
             response.raise_for_status()
             pdf_bytes = response.content
 
