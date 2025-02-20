@@ -63,13 +63,22 @@ def process_page_worker(args):
             results = []
             
             for word in words:
+                # Skip invalid or garbage text
+                text = word["text"].strip()
+                if not text or len(text) < 2:
+                    continue
+                    
+                # Skip special patterns
+                if text.startswith('>') or text.endswith('<') or text == ">dap<" or text == ">SOE<":
+                    continue
+                    
                 x0 = word["x0"] / page.width
                 y0 = word["top"] / page.height
                 x1 = word["x1"] / page.width
                 y1 = word["bottom"] / page.height
                 
                 results.append({
-                    "text": word["text"],
+                    "text": text,
                     "bbox": [x0, y0, x1, y1],
                     "page_num": page_num + 1
                 })
@@ -225,14 +234,17 @@ async def process_pdf_with_timeout(pdf_bytes: bytes):
                     detail=f"PDF has too many pages ({total_pages}). Maximum allowed is {MAX_PAGES}"
                 )
             
-            # Process in parallel with larger chunks but maintain timeout
+            # Process in parallel with larger chunks
             tasks = [(pdf_bytes, page_num) for page_num in range(total_pages)]
+            processed_pages = 0
+            all_results = []
             
             for chunk_start in range(0, len(tasks), CHUNK_SIZE):
                 if time.time() - start_time > PROCESSING_TIMEOUT:
                     logging.warning("Processing timeout reached")
                     break
 
+                chunk_end = min(chunk_start + CHUNK_SIZE, len(tasks))
                 chunk = tasks[chunk_start:chunk_end]
                 
                 with ProcessPoolExecutor(max_workers=MAX_WORKERS) as executor:
@@ -242,13 +254,35 @@ async def process_pdf_with_timeout(pdf_bytes: bytes):
                         timeout=max(1, PROCESSING_TIMEOUT - (time.time() - start_time))
                     ))
                     
-                    # Batch and send results immediately
-                    if chunk_results:
+                    # Filter out empty results and send non-empty ones
+                    filtered_results = []
+                    for result in chunk_results:
+                        if result and len(result) > 0:
+                            filtered_results.extend(result)
+                    
+                    if filtered_results:
+                        all_results.extend(filtered_results)
                         yield (json.dumps({
                             "type": "data",
-                            "extracted_data": chunk_results,
+                            "extracted_data": filtered_results,
                             "is_complete": False
                         }) + "\n").encode("utf-8")
+                    
+                    processed_pages += len(chunk)
+                    yield (json.dumps({
+                        "type": "progress",
+                        "processed_pages": processed_pages,
+                        "total_pages": total_pages
+                    }) + "\n").encode("utf-8")
+
+            # Send final complete message with any remaining results
+            yield (json.dumps({
+                "type": "data",
+                "extracted_data": all_results,  # Send all results one final time
+                "is_complete": True,
+                "total_pages": total_pages,
+                "processed_pages": processed_pages
+            }) + "\n").encode("utf-8")
 
     except Exception as e:
         logging.error(f"Processing error: {str(e)}", exc_info=True)

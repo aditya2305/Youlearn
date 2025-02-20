@@ -22,18 +22,31 @@ export default function Home() {
   const pendingUpdatesRef = useRef<ExtractedText[]>([]);
 
   const batchUpdateText = useCallback((newTexts: ExtractedText[]) => {
-    pendingUpdatesRef.current = [...pendingUpdatesRef.current, ...newTexts];
+    // Filter out invalid text items
+    const validTexts = newTexts.filter(item => {
+      const text = item?.text?.trim();
+      return text && 
+             text.length >= 2 && 
+             !text.startsWith('>') && 
+             !text.endsWith('<') &&
+             text !== ">dap<" &&
+             text !== ">SOE<";
+    });
 
-    // Clear existing timeout
-    if (batchTimeoutRef.current) {
-      clearTimeout(batchTimeoutRef.current);
-    }
+    if (validTexts.length === 0) return;
 
-    // Set new timeout to batch updates
-    batchTimeoutRef.current = setTimeout(() => {
-      setExtractedText(current => [...current, ...pendingUpdatesRef.current]);
-      pendingUpdatesRef.current = [];
-    }, 500); // Adjust this delay as needed
+    setExtractedText(current => {
+      const newState = [...current];
+      validTexts.forEach(text => {
+        if (!newState.some(existing => 
+          existing.text === text.text && 
+          existing.page_num === text.page_num
+        )) {
+          newState.push(text);
+        }
+      });
+      return newState;
+    });
   }, []);
 
   // Clean up timeout on unmount
@@ -54,6 +67,7 @@ export default function Home() {
     setError('');
     setExtractedText([]);
     setProcessingProgress(0);
+    console.log('Starting extraction...');
 
     try {
       const response = await fetch('/api/extract-pdf', {
@@ -79,46 +93,40 @@ export default function Home() {
         buffer += decoder.decode(value, { stream: true });
         const lines = buffer.split('\n');
         
+        console.log('Processing lines:', lines.length - 1);
+        
         for (let i = 0; i < lines.length - 1; i++) {
           const line = lines[i].trim();
           if (!line) continue;
 
           try {
             const data = JSON.parse(line);
+            console.log('Received data:', data.type, data.extracted_data?.length || 0);
             
             if (data.type === 'progress') {
               const progress = (data.processed_pages / data.total_pages) * 100;
               setProcessingProgress(Math.round(progress));
             } else if (data.type === 'data') {
               if (data.extracted_data?.length > 0) {
+                console.log('Adding new text chunks:', data.extracted_data.length);
                 batchUpdateText(data.extracted_data);
               }
               if (data.is_complete) {
+                console.log('Processing complete');
                 setLoading(false);
               }
             }
           } catch (e) {
-            console.error('Error parsing JSON:', e);
+            console.error('Error parsing JSON:', e, 'Line:', line);
           }
         }
         
         buffer = lines[lines.length - 1];
       }
 
-      // Process any remaining data
-      if (buffer.trim()) {
-        try {
-          const data = JSON.parse(buffer);
-          if (data.type === 'data' && data.extracted_data?.length > 0) {
-            batchUpdateText(data.extracted_data);
-          }
-        } catch (e) {
-          console.error('Error parsing final JSON:', e);
-        }
-      }
-
       setError('');
     } catch (err: any) {
+      console.error('Extraction error:', err);
       setError(err.message);
       setLoading(false);
     }

@@ -21,7 +21,8 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
         return res.status(400).json({ error: 'Missing PDF URL' });
       }
 
-      // Forward the streaming response from backend
+      console.log('Sending request to backend:', BACKEND_URL);
+
       const response = await fetch(`${BACKEND_URL}/extract`, {
         method: 'POST',
         headers: { 
@@ -33,6 +34,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
 
       if (!response.ok) {
         const errorData = await response.json();
+        console.error('Backend error:', errorData);
         return res.status(response.status).json(errorData);
       }
 
@@ -47,12 +49,14 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
         const { done, value } = await reader.read();
         if (done) break;
         
-        // Forward the chunk to the client
+        // Log the chunk being sent
+        console.log('Sending chunk to client:', new TextDecoder().decode(value));
         res.write(value);
       }
 
       res.end();
     } catch (error: any) {
+      console.error('API error:', error);
       return res.status(500).json({ 
         error: 'Extraction failed',
         details: error.message 

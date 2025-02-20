@@ -19,6 +19,9 @@ const Row = memo(({ data, index, style }: {
   style: React.CSSProperties 
 }) => {
   const chunk = data.items[index];
+  // Skip rendering if text is empty
+  if (!chunk?.text?.trim()) return null;
+  
   return (
     <div
       style={style}
@@ -39,11 +42,21 @@ const TranscriptPanel: React.FC<TranscriptPanelProps> = ({
   extractedText,
   onTextClick,
 }) => {
+  // Filter out invalid text items
+  const validExtractedText = extractedText.filter(item => {
+    const text = item?.text?.trim();
+    return text && 
+           text !== ">dap<" && 
+           text.length >= 2 && 
+           !text.startsWith(">") && 
+           !text.endsWith("<");
+  });
+
   // Memoize the items data to prevent unnecessary re-renders
   const itemData = React.useMemo(() => ({
-    items: extractedText,
+    items: validExtractedText,
     onTextClick,
-  }), [extractedText, onTextClick]);
+  }), [validExtractedText, onTextClick]);
 
   return (
     <div className="h-[800px] bg-white rounded-lg shadow overflow-hidden">
@@ -51,12 +64,12 @@ const TranscriptPanel: React.FC<TranscriptPanelProps> = ({
         <h2 className="text-xl font-bold text-gray-800">Transcript</h2>
       </div>
       <div className="h-[calc(100%-4rem)]">
-        {extractedText?.length === 0 ? (
+        {validExtractedText.length === 0 ? (
           <p className="text-gray-500 text-center p-4">No extracted text available</p>
         ) : (
           <List
             height={700}
-            itemCount={extractedText.length}
+            itemCount={validExtractedText.length}
             itemSize={80}
             width="100%"
             itemData={itemData}
