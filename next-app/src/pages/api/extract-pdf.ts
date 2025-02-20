@@ -3,6 +3,15 @@ import type { NextApiRequest, NextApiResponse } from 'next';
 
 const BACKEND_URL = process.env.BACKEND_URL || 'http://localhost:8000';
 
+export const config = {
+  api: {
+    bodyParser: {
+      sizeLimit: '10mb',
+    },
+    responseLimit: false, // Disable response size limit for streaming
+  },
+}
+
 export default async function handler(req: NextApiRequest, res: NextApiResponse) {
   if (req.method === 'POST') {
     try {
@@ -12,13 +21,14 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
         return res.status(400).json({ error: 'Missing PDF URL' });
       }
 
+      // Forward the streaming response from backend
       const response = await fetch(`${BACKEND_URL}/extract`, {
         method: 'POST',
         headers: { 
           'Content-Type': 'application/json',
           'Accept': 'application/json'
         },
-        body: JSON.stringify({ pdf_url: pdfUrl })
+        body: JSON.stringify({ pdf_url: pdfUrl }),
       });
 
       if (!response.ok) {
@@ -26,8 +36,22 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
         return res.status(response.status).json(errorData);
       }
 
-      const data = await response.json();
-      return res.status(200).json(data);
+      // Set up streaming response
+      res.setHeader('Content-Type', 'application/json');
+      res.setHeader('Transfer-Encoding', 'chunked');
+
+      const reader = response.body?.getReader();
+      if (!reader) throw new Error('No reader available');
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        
+        // Forward the chunk to the client
+        res.write(value);
+      }
+
+      res.end();
     } catch (error: any) {
       return res.status(500).json({ 
         error: 'Extraction failed',

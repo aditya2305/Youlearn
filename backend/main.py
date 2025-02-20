@@ -9,11 +9,16 @@ from PIL import Image
 import io
 import logging
 from PIL import ImageEnhance
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ProcessPoolExecutor
 import asyncio
 from functools import partial
 import time
 import httpx
+from fastapi.responses import StreamingResponse
+import multiprocessing
+import json
+
+multiprocessing.set_start_method("fork", force=True)
 
 app = FastAPI()
 
@@ -27,11 +32,12 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Add timeout and processing status tracking
-PROCESSING_TIMEOUT = 75  # 75 seconds max processing time
-MAX_WORKERS = 4  # Limit concurrent processing
-CHUNK_SIZE = 50  # Process 50 pages at a time
-MAX_PAGES = 1500  # Maximum pages allowed
+# Adjust processing parameters for speed
+PROCESSING_TIMEOUT = 75  # Set to 75 seconds max
+MAX_WORKERS = 32  # Increase worker threads significantly
+CHUNK_SIZE = 10  # Smaller chunks for faster partial results
+BATCH_SIZE = 50  # Number of pages to process before sending partial results
+MAX_PAGES = 2000  # Increase maximum allowed pages
 
 class ProcessingStatus:
     def __init__(self):
@@ -41,6 +47,32 @@ class ProcessingStatus:
 
 class ExtractRequest(BaseModel):
     pdf_url: HttpUrl
+
+# Global variable in the worker to hold the opened PDF
+global_pdf = None
+
+def init_worker(pdf_bytes):
+    """
+    Initializer for each worker process: open the PDF and monkey-patch the
+    cached method to allow pickling.
+    """
+    # Remove the lru_cache wrapper from the _get_text_layout method.
+    # This avoids the pickle error when using the multiprocessing spawn method.
+    from pdfplumber.page import Page
+    if hasattr(Page._get_text_layout, "__wrapped__"):
+        Page._get_text_layout = Page._get_text_layout.__wrapped__
+    global global_pdf
+    global_pdf = pdfplumber.open(io.BytesIO(pdf_bytes))
+
+def process_page_worker(page_index, process_type):
+    """Worker function: get page by index from the global PDF and process it."""
+    global global_pdf
+    try:
+        page = global_pdf.pages[page_index]
+        return process_page(page, process_type)
+    except Exception as e:
+        logging.error(f"Error processing page {page_index}: {str(e)}")
+        return []
 
 def process_searchable_pdf(pdf_bytes: bytes):
     """Extract searchable text from a PDF and return normalized coordinates [0..1]."""
@@ -115,7 +147,9 @@ def ocr_pdf(pdf_bytes: bytes):
     return ocr_results
 
 def process_page(page, process_type="searchable"):
-    """Process a single page with timeout control"""
+    """Process a single page with timeout control.
+    This function will be called in a separate process.
+    """
     try:
         if process_type == "searchable":
             page_width = page.width
@@ -131,7 +165,7 @@ def process_page(page, process_type="searchable"):
                 ],
                 "page_num": page.page_number
             } for w in words]
-        else:  # OCR
+        else:  # OCR path
             img_page = page.to_image(resolution=300)
             img = process_image_for_ocr(img_page.original)
             return perform_ocr_on_image(img, page.page_number)
@@ -172,111 +206,115 @@ def perform_ocr_on_image(img, page_number):
         return []
 
 async def process_pdf_with_timeout(pdf_bytes: bytes):
-    """Process PDF with timeout and parallel processing"""
+    """Process a PDF in batches with a maximum timeout of 75 seconds.
+    Yields partial results as JSON-encoded bytes with newline delimiter.
+    """
     start_time = time.time()
     text_with_bboxes = []
+    current_batch = []
     
     try:
-        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-            total_pages = len(pdf.pages)
-            
-            if total_pages > MAX_PAGES:
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"PDF has too many pages ({total_pages}). Maximum allowed is {MAX_PAGES}"
-                )
+        # Use a temporary pdfplumber instance to determine total pages
+        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf_temp:
+            total_pages = len(pdf_temp.pages)
+        if total_pages > MAX_PAGES:
+            raise HTTPException(
+                status_code=400,
+                detail=f"PDF has too many pages ({total_pages}). Maximum allowed is {MAX_PAGES}"
+            )
+        
+        # Send initial progress message
+        yield (json.dumps({
+            "type": "progress",
+            "total_pages": total_pages,
+            "processed_pages": 0
+        }) + "\n").encode("utf-8")
 
-            # Process pages in chunks
+        loop = asyncio.get_event_loop()
+        with ProcessPoolExecutor(max_workers=MAX_WORKERS, initializer=init_worker, initargs=(pdf_bytes,)) as executor:
             for chunk_start in range(0, total_pages, CHUNK_SIZE):
                 if time.time() - start_time > PROCESSING_TIMEOUT:
-                    raise TimeoutError("Processing timeout exceeded")
+                    yield (json.dumps({
+                        "type": "data",
+                        "extracted_data": text_with_bboxes,
+                        "is_complete": True
+                    }) + "\n").encode("utf-8")
+                    return
                 
                 chunk_end = min(chunk_start + CHUNK_SIZE, total_pages)
-                chunk_pages = pdf.pages[chunk_start:chunk_end]
+                tasks = [
+                    loop.run_in_executor(executor, process_page_worker, page_index, "searchable")
+                    for page_index in range(chunk_start, chunk_end)
+                ]
+                chunk_results = await asyncio.gather(*tasks)
+                chunk_text = [item for sublist in chunk_results for item in sublist]
                 
-                # Process chunk with parallel execution
-                with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-                    loop = asyncio.get_event_loop()
-                    tasks = []
-                    
-                    for page in chunk_pages:
-                        task = loop.run_in_executor(
-                            executor,
-                            partial(process_page, page, "searchable")
-                        )
-                        tasks.append(task)
-                    
-                    chunk_results = await asyncio.gather(*tasks)
-                    chunk_text = [item for sublist in chunk_results for item in sublist]
-                    
-                    if chunk_text:  # If searchable text found
-                        text_with_bboxes.extend(chunk_text)
-                    else:  # Try OCR for this chunk
-                        ocr_tasks = []
-                        for page in chunk_pages:
-                            task = loop.run_in_executor(
-                                executor,
-                                partial(process_page, page, "ocr")
-                            )
-                            ocr_tasks.append(task)
-                        
-                        ocr_results = await asyncio.gather(*ocr_tasks)
-                        text_with_bboxes.extend([
-                            item for sublist in ocr_results for item in sublist
-                        ])
-
+                if chunk_text:
+                    current_batch.extend(chunk_text)
+                else:
+                    tasks = [
+                        loop.run_in_executor(executor, process_page_worker, page_index, "ocr")
+                        for page_index in range(chunk_start, chunk_end)
+                    ]
+                    ocr_results = await asyncio.gather(*tasks)
+                    current_batch.extend([item for sublist in ocr_results for item in sublist])
+                
+                # Send progress update
+                yield (json.dumps({
+                    "type": "progress",
+                    "total_pages": total_pages,
+                    "processed_pages": chunk_end
+                }) + "\n").encode("utf-8")
+                
+                if len(current_batch) >= BATCH_SIZE:
+                    text_with_bboxes.extend(current_batch)
+                    yield (json.dumps({
+                        "type": "data",
+                        "extracted_data": current_batch,
+                        "is_complete": False
+                    }) + "\n").encode("utf-8")
+                    current_batch = []
+            
+            if current_batch:
+                text_with_bboxes.extend(current_batch)
+                yield (json.dumps({
+                    "type": "data",
+                    "extracted_data": current_batch,
+                    "is_complete": False
+                }) + "\n").encode("utf-8")
+            
+            # Final completion message
+            yield (json.dumps({
+                "type": "data",
+                "extracted_data": [],
+                "is_complete": True
+            }) + "\n").encode("utf-8")
+    
     except TimeoutError:
-        logging.error("PDF processing timeout")
-        raise HTTPException(status_code=408, detail="Processing timeout exceeded")
+        yield (json.dumps({
+            "type": "data",
+            "extracted_data": text_with_bboxes,
+            "is_complete": True
+        }) + "\n").encode("utf-8")
     except Exception as e:
         logging.error(f"PDF processing error: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
-
-    return text_with_bboxes
 
 @app.post("/extract")
 async def extract_text(request: ExtractRequest):
     try:
         logging.info(f"Received request for URL: {request.pdf_url}")
-        
-        # Download PDF with timeout
         async with httpx.AsyncClient() as client:
-            try:
-                response = await client.get(
-                    str(request.pdf_url),
-                    timeout=30.0
-                )
-                response.raise_for_status()
-                pdf_bytes = response.content
-            except Exception as e:
-                logging.error(f"PDF download error: {str(e)}")
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"Failed to download PDF: {str(e)}"
-                )
+            response = await client.get(str(request.pdf_url), timeout=30.0)
+            response.raise_for_status()
+            pdf_bytes = response.content
 
-        # Process PDF with timeout
-        try:
-            result = await process_pdf_with_timeout(pdf_bytes)
-        except Exception as e:
-            logging.error(f"PDF processing error: {str(e)}")
-            raise HTTPException(
-                status_code=500,
-                detail=f"Failed to process PDF: {str(e)}"
-            )
-        
-        if not result:
-            raise HTTPException(
-                status_code=422,
-                detail="No text could be extracted from the PDF"
-            )
+        # Stream partial results back as they become available
+        return StreamingResponse(
+            process_pdf_with_timeout(pdf_bytes),
+            media_type="application/json"
+        )
 
-        return {"extracted_data": result}
-
-    except TimeoutError:
-        raise HTTPException(status_code=408, detail="Processing timeout exceeded")
-    except HTTPException as e:
-        raise e
     except Exception as e:
         logging.error(f"Unexpected error: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))

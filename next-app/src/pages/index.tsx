@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useState, useCallback, useRef, useEffect } from 'react';
 import dynamic from 'next/dynamic';
 import TranscriptPanel from '@/components/TranscriptPanel';
 
@@ -6,8 +6,8 @@ const PdfViewerDynamic = dynamic(() => import('@/components/PdfViewer'), { ssr: 
 
 interface ExtractedText {
   text: string;
-  bbox: number[];  
-  page_num: number;  
+  bbox: number[];
+  page_num: number;
 }
 
 export default function Home() {
@@ -17,6 +17,33 @@ export default function Home() {
   const [currentPage, setCurrentPage] = useState(1);
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
+  const [processingProgress, setProcessingProgress] = useState(0);
+  const batchTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+  const pendingUpdatesRef = useRef<ExtractedText[]>([]);
+
+  const batchUpdateText = useCallback((newTexts: ExtractedText[]) => {
+    pendingUpdatesRef.current = [...pendingUpdatesRef.current, ...newTexts];
+
+    // Clear existing timeout
+    if (batchTimeoutRef.current) {
+      clearTimeout(batchTimeoutRef.current);
+    }
+
+    // Set new timeout to batch updates
+    batchTimeoutRef.current = setTimeout(() => {
+      setExtractedText(current => [...current, ...pendingUpdatesRef.current]);
+      pendingUpdatesRef.current = [];
+    }, 500); // Adjust this delay as needed
+  }, []);
+
+  // Clean up timeout on unmount
+  useEffect(() => {
+    return () => {
+      if (batchTimeoutRef.current) {
+        clearTimeout(batchTimeoutRef.current);
+      }
+    };
+  }, []);
 
   const handleExtract = async () => {
     if (!pdfUrl) {
@@ -25,37 +52,74 @@ export default function Home() {
     }
     setLoading(true);
     setError('');
+    setExtractedText([]);
+    setProcessingProgress(0);
 
     try {
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 80000); // 80s timeout
-
       const response = await fetch('/api/extract-pdf', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ pdfUrl }),
-        signal: controller.signal
+        body: JSON.stringify({ pdfUrl })
       });
 
-      clearTimeout(timeoutId);
-
       if (!response.ok) {
-        const errorData = await response.json();
-        if (response.status === 408) {
-          throw new Error('Processing timeout exceeded. Please try again with a smaller PDF.');
-        }
-        throw new Error(errorData.error || 'Extraction failed');
+        throw new Error('Extraction failed');
       }
 
-      const data = await response.json();
-      setExtractedText(data.extracted_data);
-    } catch (err: any) {
-      if (err.name === 'AbortError') {
-        setError('Request timed out. Please try again with a smaller PDF.');
-      } else {
-        setError(err.message);
+      const reader = response.body?.getReader();
+      if (!reader) throw new Error('No reader available');
+
+      const decoder = new TextDecoder();
+      let buffer = '';
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        
+        for (let i = 0; i < lines.length - 1; i++) {
+          const line = lines[i].trim();
+          if (!line) continue;
+
+          try {
+            const data = JSON.parse(line);
+            
+            if (data.type === 'progress') {
+              const progress = (data.processed_pages / data.total_pages) * 100;
+              setProcessingProgress(Math.round(progress));
+            } else if (data.type === 'data') {
+              if (data.extracted_data?.length > 0) {
+                batchUpdateText(data.extracted_data);
+              }
+              if (data.is_complete) {
+                setLoading(false);
+              }
+            }
+          } catch (e) {
+            console.error('Error parsing JSON:', e);
+          }
+        }
+        
+        buffer = lines[lines.length - 1];
       }
-    } finally {
+
+      // Process any remaining data
+      if (buffer.trim()) {
+        try {
+          const data = JSON.parse(buffer);
+          if (data.type === 'data' && data.extracted_data?.length > 0) {
+            batchUpdateText(data.extracted_data);
+          }
+        } catch (e) {
+          console.error('Error parsing final JSON:', e);
+        }
+      }
+
+      setError('');
+    } catch (err: any) {
+      setError(err.message);
       setLoading(false);
     }
   };
