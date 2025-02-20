@@ -67,7 +67,6 @@ export default function Home() {
     setError('');
     setExtractedText([]);
     setProcessingProgress(0);
-    console.log('Starting extraction...');
 
     try {
       const response = await fetch('/api/extract-pdf', {
@@ -87,44 +86,59 @@ export default function Home() {
       let buffer = '';
 
       while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
+        try {
+          const { done, value } = await reader.read();
+          if (done) break;
 
-        buffer += decoder.decode(value, { stream: true });
-        const lines = buffer.split('\n');
-        
-        console.log('Processing lines:', lines.length - 1);
-        
-        for (let i = 0; i < lines.length - 1; i++) {
-          const line = lines[i].trim();
-          if (!line) continue;
+          buffer += decoder.decode(value, { stream: true });
+          const lines = buffer.split('\n');
+          
+          for (let i = 0; i < lines.length - 1; i++) {
+            const line = lines[i].trim();
+            if (!line) continue;
 
-          try {
-            const data = JSON.parse(line);
-            console.log('Received data:', data.type, data.extracted_data?.length || 0);
-            
-            if (data.type === 'progress') {
-              const progress = (data.processed_pages / data.total_pages) * 100;
-              setProcessingProgress(Math.round(progress));
-            } else if (data.type === 'data') {
-              if (data.extracted_data?.length > 0) {
-                console.log('Adding new text chunks:', data.extracted_data.length);
-                batchUpdateText(data.extracted_data);
+            try {
+              const data = JSON.parse(line);
+              
+              switch (data.type) {
+                case 'progress':
+                  const progress = (data.processed_pages / data.total_pages) * 100;
+                  setProcessingProgress(Math.round(progress));
+                  break;
+                case 'data':
+                  if (data.extracted_data?.length > 0) {
+                    batchUpdateText(data.extracted_data);
+                  }
+                  if (data.is_complete) {
+                    setLoading(false);
+                  }
+                  break;
+                case 'warning':
+                  console.warn(data.message);
+                  break;
+                case 'error':
+                  setError(data.message);
+                  setLoading(false);
+                  return;
               }
-              if (data.is_complete) {
-                console.log('Processing complete');
-                setLoading(false);
-              }
+            } catch (e) {
+              console.error('Error parsing JSON:', e, 'Line:', line);
             }
-          } catch (e) {
-            console.error('Error parsing JSON:', e, 'Line:', line);
           }
+          
+          buffer = lines[lines.length - 1];
+        } catch (streamError) {
+          console.error('Stream error:', streamError);
+          if (!extractedText.length) {
+            setError('Connection lost. Please try again.');
+          } else {
+            setError('Connection lost, but some text was extracted.');
+          }
+          break;
         }
-        
-        buffer = lines[lines.length - 1];
       }
 
-      setError('');
+      setLoading(false);
     } catch (err: any) {
       console.error('Extraction error:', err);
       setError(err.message);

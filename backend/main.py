@@ -234,58 +234,78 @@ async def process_pdf_with_timeout(pdf_bytes: bytes):
                     detail=f"PDF has too many pages ({total_pages}). Maximum allowed is {MAX_PAGES}"
                 )
             
-            # Process in parallel with larger chunks
             tasks = [(pdf_bytes, page_num) for page_num in range(total_pages)]
             processed_pages = 0
             all_results = []
             
+            # Send initial progress
+            yield (json.dumps({
+                "type": "progress",
+                "processed_pages": 0,
+                "total_pages": total_pages
+            }) + "\n").encode("utf-8")
+
             for chunk_start in range(0, len(tasks), CHUNK_SIZE):
                 if time.time() - start_time > PROCESSING_TIMEOUT:
-                    logging.warning("Processing timeout reached")
+                    # Send timeout warning instead of breaking
+                    yield (json.dumps({
+                        "type": "warning",
+                        "message": "Processing timeout reached",
+                        "processed_pages": processed_pages,
+                        "total_pages": total_pages
+                    }) + "\n").encode("utf-8")
                     break
 
                 chunk_end = min(chunk_start + CHUNK_SIZE, len(tasks))
                 chunk = tasks[chunk_start:chunk_end]
                 
-                with ProcessPoolExecutor(max_workers=MAX_WORKERS) as executor:
-                    chunk_results = list(executor.map(
-                        process_page_worker, 
-                        chunk,
-                        timeout=max(1, PROCESSING_TIMEOUT - (time.time() - start_time))
-                    ))
-                    
-                    # Filter out empty results and send non-empty ones
-                    filtered_results = []
-                    for result in chunk_results:
-                        if result and len(result) > 0:
-                            filtered_results.extend(result)
-                    
-                    if filtered_results:
-                        all_results.extend(filtered_results)
+                try:
+                    with ProcessPoolExecutor(max_workers=MAX_WORKERS) as executor:
+                        chunk_results = list(executor.map(
+                            process_page_worker, 
+                            chunk,
+                            timeout=max(1, PROCESSING_TIMEOUT - (time.time() - start_time))
+                        ))
+                        
+                        filtered_results = []
+                        for result in chunk_results:
+                            if result and len(result) > 0:
+                                filtered_results.extend(result)
+                        
+                        if filtered_results:
+                            all_results.extend(filtered_results)
+                            yield (json.dumps({
+                                "type": "data",
+                                "extracted_data": filtered_results,
+                                "is_complete": False
+                            }) + "\n").encode("utf-8")
+                        
+                        processed_pages += len(chunk)
                         yield (json.dumps({
-                            "type": "data",
-                            "extracted_data": filtered_results,
-                            "is_complete": False
+                            "type": "progress",
+                            "processed_pages": processed_pages,
+                            "total_pages": total_pages
                         }) + "\n").encode("utf-8")
-                    
-                    processed_pages += len(chunk)
-                    yield (json.dumps({
-                        "type": "progress",
-                        "processed_pages": processed_pages,
-                        "total_pages": total_pages
-                    }) + "\n").encode("utf-8")
+                except Exception as chunk_error:
+                    logging.error(f"Chunk processing error: {str(chunk_error)}")
+                    continue
 
-            # Send final complete message with any remaining results
+            # Always send final complete message
             yield (json.dumps({
                 "type": "data",
-                "extracted_data": all_results,  # Send all results one final time
+                "extracted_data": [],
                 "is_complete": True,
-                "total_pages": total_pages,
-                "processed_pages": processed_pages
+                "processed_pages": processed_pages,
+                "total_pages": total_pages
             }) + "\n").encode("utf-8")
 
     except Exception as e:
         logging.error(f"Processing error: {str(e)}", exc_info=True)
+        # Send error message before raising exception
+        yield (json.dumps({
+            "type": "error",
+            "message": str(e)
+        }) + "\n").encode("utf-8")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/extract")
